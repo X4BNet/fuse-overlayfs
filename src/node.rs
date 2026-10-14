@@ -199,8 +199,14 @@ impl OvlNode {
         matches!(self.dir_state, DirState::Dir { .. })
     }
 
-    /// Mark metadata populated from a full underlying stat.
-    pub fn set_metadata(&mut self, st: &libc::stat) {
+    /// Populate metadata for a node created from directory-entry data.
+    ///
+    /// Once populated, the inode and device form the node's stable registration
+    /// key and must survive copy-up to a different underlying inode.
+    pub fn hydrate_metadata(&mut self, st: &libc::stat) {
+        if self.metadata_valid {
+            return;
+        }
         self.tmp_ino = st.st_ino as u64;
         self.tmp_dev = st.st_dev as u64;
         self.tmp_nlink = st.st_nlink as u64;
@@ -661,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_metadata_marks_dirent_node_valid() {
+    fn test_hydrate_metadata_marks_dirent_node_valid() {
         let mut node = OvlNode::new(b"file".to_vec(), 0, 10, 20, false);
         node.metadata_valid = false;
         let mut st = crate::sys::fs::zeroed_stat();
@@ -670,13 +676,32 @@ mod tests {
         st.st_nlink = 2;
         st.st_mode = libc::S_IFREG | 0o640;
 
-        node.set_metadata(&st);
+        node.hydrate_metadata(&st);
 
         assert!(node.metadata_valid);
         assert_eq!(node.tmp_ino, 30);
         assert_eq!(node.tmp_dev, 40);
         assert_eq!(node.tmp_nlink, 2);
         assert_eq!(node.mode, libc::S_IFREG | 0o640);
+    }
+
+    #[test]
+    fn test_hydrate_metadata_preserves_existing_inode_identity() {
+        let mut node = OvlNode::new(b"file".to_vec(), 1, 10, 20, false);
+        node.tmp_nlink = 1;
+        node.mode = libc::S_IFREG | 0o600;
+        let mut st = crate::sys::fs::zeroed_stat();
+        st.st_ino = 30;
+        st.st_dev = 40;
+        st.st_nlink = 2;
+        st.st_mode = libc::S_IFREG | 0o640;
+
+        node.hydrate_metadata(&st);
+
+        assert_eq!(node.tmp_ino, 10);
+        assert_eq!(node.tmp_dev, 20);
+        assert_eq!(node.tmp_nlink, 1);
+        assert_eq!(node.mode, libc::S_IFREG | 0o600);
     }
 
     #[test]

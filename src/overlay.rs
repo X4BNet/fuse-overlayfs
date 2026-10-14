@@ -817,7 +817,7 @@ impl OverlayInner {
         let node = self.nodes.get(&node_id).ok_or(FsError(libc::ENOENT))?;
         let st = self.do_stat_with_path(node, fd, path)?;
         if let Some(node) = self.nodes.get_mut(&node_id) {
-            node.set_metadata(&st);
+            node.hydrate_metadata(&st);
         }
         self.finish_stat_with_path(node_id, fd, config, path, st)
     }
