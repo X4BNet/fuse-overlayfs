@@ -203,6 +203,9 @@ impl OvlNode {
     ///
     /// Once populated, the inode and device form the node's stable registration
     /// key and must survive copy-up to a different underlying inode.
+    /// libc stat field widths vary across supported architectures, so the
+    /// conversions are redundant on some targets but required on others.
+    #[allow(clippy::unnecessary_cast)]
     pub fn hydrate_metadata(&mut self, st: &libc::stat) {
         if self.metadata_valid {
             return;
