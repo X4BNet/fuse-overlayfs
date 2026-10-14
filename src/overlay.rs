@@ -201,7 +201,6 @@ struct DirEntry {
     name: Vec<u8>,
     ino: u64,
     mode: u32,
-    attr: Option<FileAttr>,
     node_id: Option<NodeId>,
 }
 
@@ -1366,61 +1365,48 @@ impl OverlayInner {
 
         // "." entry
         let self_ino = self.get_st_ino_with_path(node, &dir_path, config);
-        let self_attr = self
-            .rpl_stat_with_path(node_id, -1, config, &dir_path)
-            .ok()
-            .map(|st| stat_to_attr(&st));
         entries.push(DirEntry {
             name: b".".to_vec(),
             ino: self_ino,
             mode: libc::S_IFDIR,
-            attr: self_attr,
             node_id: Some(node_id),
         });
 
         // ".." entry
         let parent_id = node.parent;
-        let (parent_ino, parent_attr) = if let Some(pid) = parent_id {
+        let parent_ino = if let Some(pid) = parent_id {
             if let Some(parent) = self.nodes.get(&pid) {
                 let parent_path = self.node_path(pid);
-                let ino = self.get_st_ino_with_path(parent, &parent_path, config);
-                let attr = self
-                    .rpl_stat_with_path(pid, -1, config, &parent_path)
-                    .ok()
-                    .map(|st| stat_to_attr(&st));
-                (ino, attr)
+                self.get_st_ino_with_path(parent, &parent_path, config)
             } else {
-                (self_ino, self_attr)
+                self_ino
             }
         } else {
-            (self_ino, self_attr)
+            self_ino
         };
         entries.push(DirEntry {
             name: b"..".to_vec(),
             ino: parent_ino,
             mode: libc::S_IFDIR,
-            attr: parent_attr,
             node_id: parent_id,
         });
 
-        // Own names so metadata can be refreshed while iterating children.
+        // Own names so the handle remains valid if the in-memory tree changes.
         let mut child_ids: Vec<(Vec<u8>, NodeId)> = node
             .children()
             .map(|ch| ch.iter().map(|(k, v)| (k.clone(), *v)).collect())
             .unwrap_or_default();
         child_ids.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
 
-        // Reusable buffer for child paths (avoids N allocations)
+        // Reusable buffer for child paths (avoids N allocations).  Only inode
+        // calculation may use the path here; full attributes are loaded lazily
+        // by readdirplus and are unnecessary for ordinary readdir.
         let mut path_buf = Vec::with_capacity(dir_path.len() + 256);
         for (child_name, child_id) in child_ids {
-            if self
-                .nodes
-                .get(&child_id)
-                .map(|child| child.hidden)
-                .unwrap_or(true)
-            {
-                continue;
-            }
+            let child = match self.nodes.get(&child_id) {
+                Some(child) if !child.hidden => child,
+                _ => continue,
+            };
 
             // Build child path in reusable buffer
             path_buf.clear();
@@ -1430,25 +1416,10 @@ impl OverlayInner {
             }
             path_buf.extend_from_slice(&child_name);
 
-            let stat = self
-                .rpl_stat_with_path_cached(child_id, -1, config, &path_buf)
-                .ok();
-            let (ino, mode, attr) = if let Some(st) = stat {
-                (st.st_ino as u64, st.st_mode, Some(stat_to_attr(&st)))
-            } else if let Some(child) = self.nodes.get(&child_id) {
-                (
-                    self.get_st_ino_with_path(child, &path_buf, config),
-                    child.mode,
-                    None,
-                )
-            } else {
-                continue;
-            };
             entries.push(DirEntry {
                 name: child_name,
-                ino,
-                mode,
-                attr,
+                ino: self.get_st_ino_with_path(child, &path_buf, config),
+                mode: child.mode,
                 node_id: Some(child_id),
             });
         }
@@ -3642,20 +3613,31 @@ impl Filesystem for OverlayFs {
         let offset = offset as usize;
         let ttl = Duration::from_secs_f64(self.config.timeout);
 
-        // Collect entries we need to emit (clone to release dirs lock before taking inner lock)
+        // Collect entries we may emit (clone to release the directory-handle
+        // lock before taking the overlay write lock).  Metadata is hydrated one
+        // entry at a time below, so a small kernel buffer does not stat the
+        // entire remainder of a large directory.
         let entries: Vec<_> = dh
             .entries
             .iter()
             .enumerate()
             .skip(offset)
-            .map(|(i, e)| (i, e.name.clone(), e.ino, e.mode, e.attr, e.node_id))
+            .map(|(i, e)| (i, e.name.clone(), e.ino, e.mode, e.node_id))
             .collect();
         drop(dirs);
 
-        // Register entries in inode table so FUSE inodes match what lookup would return
+        // Hydrate and register entries in inode table so FUSE inodes match what
+        // lookup would return.  Ordinary readdir never enters this path.
         let mut inner = self.inner.write();
-        for (i, name, raw_ino, mode, attr, node_id) in &entries {
-            let fuse_ino = if let Some(nid) = node_id {
+        for (i, name, raw_ino, mode, node_id) in &entries {
+            let attr = node_id.and_then(|nid| {
+                inner
+                    .rpl_stat_cached(nid, -1, &self.config)
+                    .ok()
+                    .map(|st| stat_to_attr(&st))
+            });
+
+            let (fuse_ino, lookup_key) = if let Some(nid) = node_id {
                 if let Some(node) = inner.nodes.get(nid) {
                     let tmp_ino = node.tmp_ino;
                     let tmp_dev = node.tmp_dev;
@@ -3666,20 +3648,19 @@ impl Filesystem for OverlayFs {
                         .inodes
                         .register(&oi.nodes, *nid, tmp_ino, tmp_dev, nmode, is_lower)
                     {
-                        oi.inodes.inc_lookup(&key);
-                        ino_val
+                        (ino_val, Some(key))
                     } else {
-                        *raw_ino
+                        (*raw_ino, None)
                     }
                 } else {
-                    *raw_ino
+                    (*raw_ino, None)
                 }
             } else {
-                *raw_ino
+                (*raw_ino, None)
             };
 
             let mut a = match attr {
-                Some(a) => *a,
+                Some(a) => a,
                 None => FileAttr {
                     ino: INodeNo(fuse_ino),
                     size: 0,
@@ -3713,6 +3694,9 @@ impl Filesystem for OverlayFs {
                 Generation(0),
             ) {
                 break;
+            }
+            if let Some(key) = lookup_key {
+                inner.inodes.inc_lookup(&key);
             }
         }
         reply.ok();
@@ -4159,6 +4143,45 @@ fn parse_device(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_build_dir_entries_keeps_child_metadata_deferred() {
+        let mut nodes = NodeArena::new();
+        let mut root = OvlNode::new(Vec::new(), 0, 2, 7, true);
+        root.mark_loaded();
+        let root_id = nodes.insert(root);
+
+        let mut child = OvlNode::new(b"child".to_vec(), 0, 42, 7, false);
+        child.mode = libc::S_IFREG;
+        child.metadata_valid = false;
+        child.parent = Some(root_id);
+        let child_id = nodes.insert(child);
+        nodes
+            .get_mut(&root_id)
+            .unwrap()
+            .insert_child(b"child".to_vec(), child_id);
+
+        let mut inner = OverlayInner {
+            layers: Vec::new(),
+            inodes: InodeTable::new(),
+            nodes,
+            root_id,
+            parent_fds: Mutex::new(ParentFdCache::new(0)),
+            workdir_fd: -1,
+            ino_passthrough: true,
+            overflow: OverflowIds::read(),
+            wd_counter: 1,
+            can_mknod: false,
+        };
+
+        let entries = inner.build_dir_entries(root_id, &OverlayConfig::default());
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2].name, b"child");
+        assert_eq!(entries[2].ino, 42);
+        assert_eq!(entries[2].mode, libc::S_IFREG);
+        assert!(!inner.nodes.get(&child_id).unwrap().metadata_valid);
+    }
 
     #[test]
     fn test_parent_fd_cache_evicts_least_recently_used() {
