@@ -422,6 +422,20 @@ fn mode_to_filetype(mode: u32) -> FileType {
     }
 }
 
+/// Convert a dirent d_type value to the corresponding file-type mode bits.
+fn dtype_to_mode(dtype: u8) -> u32 {
+    match dtype {
+        libc::DT_DIR => libc::S_IFDIR,
+        libc::DT_REG => libc::S_IFREG,
+        libc::DT_LNK => libc::S_IFLNK,
+        libc::DT_BLK => libc::S_IFBLK,
+        libc::DT_CHR => libc::S_IFCHR,
+        libc::DT_FIFO => libc::S_IFIFO,
+        libc::DT_SOCK => libc::S_IFSOCK,
+        _ => 0,
+    }
+}
+
 impl OverlayInner {
     /// Compute the overlay-relative path for a node.
     fn node_path(&self, id: NodeId) -> Vec<u8> {
@@ -690,7 +704,36 @@ impl OverlayInner {
         path: &[u8],
     ) -> FsResult<libc::stat> {
         let node = self.nodes.get(&node_id).ok_or(FsError(libc::ENOENT))?;
-        let mut st = self.do_stat_with_path(node, fd, path)?;
+        let st = self.do_stat_with_path(node, fd, path)?;
+        self.finish_stat_with_path(node_id, fd, config, path, st)
+    }
+
+    /// Full stat that also records metadata for a node created from dirent data.
+    fn rpl_stat_with_path_cached(
+        &mut self,
+        node_id: NodeId,
+        fd: RawFd,
+        config: &OverlayConfig,
+        path: &[u8],
+    ) -> FsResult<libc::stat> {
+        let node = self.nodes.get(&node_id).ok_or(FsError(libc::ENOENT))?;
+        let st = self.do_stat_with_path(node, fd, path)?;
+        if let Some(node) = self.nodes.get_mut(&node_id) {
+            node.set_metadata(&st);
+        }
+        self.finish_stat_with_path(node_id, fd, config, path, st)
+    }
+
+    /// Apply overlay metadata transformations to an underlying stat result.
+    fn finish_stat_with_path(
+        &self,
+        node_id: NodeId,
+        fd: RawFd,
+        config: &OverlayConfig,
+        path: &[u8],
+        mut st: libc::stat,
+    ) -> FsResult<libc::stat> {
+        let node = self.nodes.get(&node_id).ok_or(FsError(libc::ENOENT))?;
 
         // Apply stat override from xattr (must be before UID/GID mapping)
         let layer = self.layer(node.layer_idx)?;
@@ -759,6 +802,26 @@ impl OverlayInner {
         Ok(st)
     }
 
+    /// Full stat with metadata caching (computes path internally).
+    fn rpl_stat_cached(
+        &mut self,
+        node_id: NodeId,
+        fd: RawFd,
+        config: &OverlayConfig,
+    ) -> FsResult<libc::stat> {
+        let node = self.nodes.get(&node_id).ok_or(FsError(libc::ENOENT))?;
+        let path = if node.hidden {
+            node.hidden_path
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes()
+                .to_vec()
+        } else {
+            self.node_path(node_id)
+        };
+        self.rpl_stat_with_path_cached(node_id, fd, config, &path)
+    }
+
     /// Full stat with UID/GID mapping and nlink computation (computes path internally).
     fn rpl_stat(&self, node_id: NodeId, fd: RawFd, config: &OverlayConfig) -> FsResult<libc::stat> {
         let node = self.nodes.get(&node_id).ok_or(FsError(libc::ENOENT))?;
@@ -817,7 +880,7 @@ impl OverlayInner {
         parent_id: NodeId,
         path: &[u8],
         last_layer_stop: Option<usize>,
-        config: &OverlayConfig,
+        _config: &OverlayConfig,
     ) {
         let mut stop_lookup = false;
 
@@ -909,30 +972,13 @@ impl OverlayInner {
                     continue;
                 }
 
-                // Check for char device (0,0) whiteout
+                // Character devices must be inspected for overlay whiteout
+                // semantics.  DT_UNKNOWN also needs a stat so directories are
+                // represented with the correct node type.
+                let mut entry_stat = None;
                 if entry.dtype == libc::DT_CHR || entry.dtype == libc::DT_UNKNOWN {
                     let node_path = Self::child_path(path, &entry.name);
                     if let Ok(st) = self.layers[layer_idx].ds.statat(
-                        &node_path,
-                        libc::AT_SYMLINK_NOFOLLOW,
-                        sstatx::STATX_TYPE,
-                    ) && Self::is_chardev_whiteout(&st)
-                    {
-                        if let Some(parent) = self.nodes.get_mut(&parent_id) {
-                            parent.insert_whiteout(entry.name);
-                        }
-                        continue;
-                    }
-                }
-
-                // Normal entry
-                let is_dir = entry.dtype == libc::DT_DIR;
-                let node_path = Self::child_path(path, &entry.name);
-
-                let (ino, dev, mode, nlink) = if config.fast_ino_check {
-                    (entry.ino, 0, if is_dir { libc::S_IFDIR } else { 0 }, 1)
-                } else {
-                    match self.layers[layer_idx].ds.statat(
                         &node_path,
                         libc::AT_SYMLINK_NOFOLLOW,
                         sstatx::STATX_TYPE
@@ -940,20 +986,42 @@ impl OverlayInner {
                             | sstatx::STATX_NLINK
                             | sstatx::STATX_INO,
                     ) {
-                        Ok(st) => (
-                            st.st_ino as u64,
-                            st.st_dev as u64,
-                            st.st_mode,
-                            st.st_nlink as u64,
-                        ),
-                        Err(_) => (entry.ino, 0, if is_dir { libc::S_IFDIR } else { 0 }, 1),
+                        if Self::is_chardev_whiteout(&st) {
+                            if let Some(parent) = self.nodes.get_mut(&parent_id) {
+                                parent.insert_whiteout(entry.name);
+                            }
+                            continue;
+                        }
+                        entry_stat = Some(st);
                     }
+                }
+
+                // Normal entries start with metadata supplied by readdir.  A
+                // full stat is deferred until lookup/getattr/readdirplus needs
+                // it, avoiding one safe path resolution per directory entry.
+                let (ino, dev, mode, nlink, metadata_valid) = if let Some(st) = entry_stat {
+                    (
+                        st.st_ino as u64,
+                        st.st_dev as u64,
+                        st.st_mode,
+                        st.st_nlink as u64,
+                        true,
+                    )
+                } else {
+                    (
+                        entry.ino,
+                        self.layers[layer_idx].st_dev() as u64,
+                        dtype_to_mode(entry.dtype),
+                        1,
+                        false,
+                    )
                 };
 
-                let actual_is_dir = (mode & libc::S_IFMT) == libc::S_IFDIR || is_dir;
-                let mut child = OvlNode::new(entry.name, layer_idx, ino, dev, actual_is_dir);
+                let is_dir = (mode & libc::S_IFMT) == libc::S_IFDIR;
+                let mut child = OvlNode::new(entry.name, layer_idx, ino, dev, is_dir);
                 child.mode = mode;
                 child.tmp_nlink = nlink;
+                child.metadata_valid = metadata_valid;
                 child.last_layer_idx = layer_idx;
                 child.parent = Some(parent_id);
                 self.insert_child_node(parent_id, child);
@@ -1213,40 +1281,54 @@ impl OverlayInner {
             node_id: parent_id,
         });
 
-        // Collect child references without cloning names, sort by reference
-        let mut child_ids: Vec<(&[u8], NodeId)> = node
+        // Own names so metadata can be refreshed while iterating children.
+        let mut child_ids: Vec<(Vec<u8>, NodeId)> = node
             .children()
-            .map(|ch| ch.iter().map(|(k, v)| (k.as_slice(), *v)).collect())
+            .map(|ch| ch.iter().map(|(k, v)| (k.clone(), *v)).collect())
             .unwrap_or_default();
-        child_ids.sort_unstable_by_key(|(a, _)| *a);
+        child_ids.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
 
         // Reusable buffer for child paths (avoids N allocations)
         let mut path_buf = Vec::with_capacity(dir_path.len() + 256);
         for (child_name, child_id) in child_ids {
-            if let Some(child) = self.nodes.get(&child_id)
-                && !child.hidden
+            if self
+                .nodes
+                .get(&child_id)
+                .map(|child| child.hidden)
+                .unwrap_or(true)
             {
-                // Build child path in reusable buffer
-                path_buf.clear();
-                if dir_path != b"." {
-                    path_buf.extend_from_slice(&dir_path);
-                    path_buf.push(b'/');
-                }
-                path_buf.extend_from_slice(&child.name);
-
-                let ino = self.get_st_ino_with_path(child, &path_buf, config);
-                let attr = self
-                    .rpl_stat_with_path(child_id, -1, config, &path_buf)
-                    .ok()
-                    .map(|st| stat_to_attr(&st));
-                entries.push(DirEntry {
-                    name: child_name.to_vec(),
-                    ino,
-                    mode: child.mode,
-                    attr,
-                    node_id: Some(child_id),
-                });
+                continue;
             }
+
+            // Build child path in reusable buffer
+            path_buf.clear();
+            if dir_path != b"." {
+                path_buf.extend_from_slice(&dir_path);
+                path_buf.push(b'/');
+            }
+            path_buf.extend_from_slice(&child_name);
+
+            let stat = self
+                .rpl_stat_with_path_cached(child_id, -1, config, &path_buf)
+                .ok();
+            let (ino, mode, attr) = if let Some(st) = stat {
+                (st.st_ino as u64, st.st_mode, Some(stat_to_attr(&st)))
+            } else if let Some(child) = self.nodes.get(&child_id) {
+                (
+                    self.get_st_ino_with_path(child, &path_buf, config),
+                    child.mode,
+                    None,
+                )
+            } else {
+                continue;
+            };
+            entries.push(DirEntry {
+                name: child_name,
+                ino,
+                mode,
+                attr,
+                node_id: Some(child_id),
+            });
         }
 
         entries
@@ -1605,7 +1687,7 @@ impl Filesystem for OverlayFs {
             return;
         }
 
-        match inner.rpl_stat(node_id, -1, &self.config) {
+        match inner.rpl_stat_cached(node_id, -1, &self.config) {
             Ok(st) => {
                 let node = match inner.node(&node_id) {
                     Ok(n) => n,
@@ -3955,6 +4037,14 @@ fn parse_device(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_dtype_to_mode() {
+        assert_eq!(dtype_to_mode(libc::DT_DIR), libc::S_IFDIR);
+        assert_eq!(dtype_to_mode(libc::DT_REG), libc::S_IFREG);
+        assert_eq!(dtype_to_mode(libc::DT_LNK), libc::S_IFLNK);
+        assert_eq!(dtype_to_mode(libc::DT_UNKNOWN), 0);
+    }
 
     #[test]
     fn test_collect_prefix_whiteouts_is_order_independent() {

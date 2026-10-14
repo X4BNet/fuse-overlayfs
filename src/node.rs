@@ -134,6 +134,9 @@ pub struct OvlNode {
     /// Link count from the underlying filesystem.  Used to detect lower-layer
     /// hardlinks at registration time so each alias gets its own FUSE inode.
     pub tmp_nlink: u64,
+    /// Whether inode, device, mode, and link count came from a full stat.
+    /// Directory scans initially populate lightweight nodes from dirent data.
+    pub metadata_valid: bool,
     /// The entry name (basename). Full path is computed on-demand via compute_path().
     pub name: Vec<u8>,
     /// When a node is hidden (moved to workdir for deferred deletion),
@@ -179,6 +182,7 @@ impl OvlNode {
             tmp_ino: ino,
             tmp_dev: dev,
             tmp_nlink: 1,
+            metadata_valid: true,
             name,
             hidden_path: None,
             hidden_dirfd: -1,
@@ -193,6 +197,15 @@ impl OvlNode {
 
     pub fn is_dir(&self) -> bool {
         matches!(self.dir_state, DirState::Dir { .. })
+    }
+
+    /// Mark metadata populated from a full underlying stat.
+    pub fn set_metadata(&mut self, st: &libc::stat) {
+        self.tmp_ino = st.st_ino as u64;
+        self.tmp_dev = st.st_dev as u64;
+        self.tmp_nlink = st.st_nlink as u64;
+        self.mode = st.st_mode;
+        self.metadata_valid = true;
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -358,6 +371,12 @@ impl InodeTable {
         mode: u32,
         is_lower: bool,
     ) -> Option<(u64, InodeKey)> {
+        // Dirent-only nodes must be fully statted before inode registration;
+        // hardlink detection depends on accurate device and nlink metadata.
+        if !arena.get(&node_id)?.metadata_valid {
+            return None;
+        }
+
         if let Some(existing_key) = self.node_map.get(&node_id) {
             if let Some(existing_ino) = self.table.get(existing_key) {
                 return Some((existing_ino.fuse_ino, *existing_key));
@@ -639,6 +658,25 @@ mod tests {
         let node = OvlNode::new(b"file".to_vec(), 0, 100, 1, false);
         assert_eq!(node.name, b"file");
         assert!(!node.is_dir());
+    }
+
+    #[test]
+    fn test_set_metadata_marks_dirent_node_valid() {
+        let mut node = OvlNode::new(b"file".to_vec(), 0, 10, 20, false);
+        node.metadata_valid = false;
+        let mut st = crate::sys::fs::zeroed_stat();
+        st.st_ino = 30;
+        st.st_dev = 40;
+        st.st_nlink = 2;
+        st.st_mode = libc::S_IFREG | 0o640;
+
+        node.set_metadata(&st);
+
+        assert!(node.metadata_valid);
+        assert_eq!(node.tmp_ino, 30);
+        assert_eq!(node.tmp_dev, 40);
+        assert_eq!(node.tmp_nlink, 2);
+        assert_eq!(node.mode, libc::S_IFREG | 0o640);
     }
 
     #[test]
