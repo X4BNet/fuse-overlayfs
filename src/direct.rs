@@ -115,6 +115,12 @@ impl DataSource for DirectAccess {
     }
 
     fn statat(&self, path: &[u8], flags: libc::c_int, mask: libc::c_uint) -> FsResult<libc::stat> {
+        // The synthetic overlay root is represented by ".".  It is already a
+        // safely opened layer descriptor, so stat it directly rather than
+        // weakening the child-basename validator to admit dot components.
+        if path == b"." {
+            return self.fstat(self.fd(), path, mask);
+        }
         // Open parent safely to prevent symlink traversal in intermediate components
         let (parent_fd, basename) = openat2::open_parent_safe(self.fd(), path)?;
         self.statat_child(parent_fd.as_ref(), basename, flags, mask)
@@ -127,9 +133,7 @@ impl DataSource for DirectAccess {
         flags: libc::c_int,
         mask: libc::c_uint,
     ) -> FsResult<libc::stat> {
-        if name.contains(&b'/') {
-            return Err(FsError(libc::EINVAL));
-        }
+        validate_child_name(name)?;
         let dirfd = parent.map(SafeFd::as_raw_fd).unwrap_or(self.fd());
         let c_name = crate::error::cstr_bytes(name)?;
 
@@ -151,8 +155,8 @@ impl DataSource for DirectAccess {
         flags: libc::c_int,
         mask: libc::c_uint,
     ) -> (FsResult<libc::stat>, bool) {
-        if name.contains(&b'/') {
-            return (Err(FsError(libc::EINVAL)), false);
+        if let Err(e) = validate_child_name(name) {
+            return (Err(e), false);
         }
         let stat = self.statat_child(parent, name, flags, mask);
         let mut whiteout = Vec::with_capacity(4 + name.len());
@@ -260,6 +264,16 @@ impl DataSource for DirectAccess {
     }
 }
 
+/// Validate a name before using it with an `*at` syscall.  Slash-free dot
+/// components are not safe basenames: `..` would escape the supplied parent
+/// descriptor and `.` would address the parent itself.
+fn validate_child_name(name: &[u8]) -> FsResult<()> {
+    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
+        return Err(FsError(libc::EINVAL));
+    }
+    Ok(())
+}
+
 impl DirectAccess {
     /// Override the detected stat override mode (used when xattr_permissions is configured).
     pub fn set_stat_override(&mut self, mode: StatOverrideMode) {
@@ -325,5 +339,40 @@ mod tests {
         );
         assert_eq!(missing.unwrap_err().0, libc::ENOENT);
         assert!(whiteout);
+    }
+
+    #[test]
+    fn test_statat_child_rejects_unsafe_basenames() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut access = new();
+        access
+            .load_data_source(temp.path().to_str().unwrap())
+            .unwrap();
+
+        let root = access
+            .statat(b".", libc::AT_SYMLINK_NOFOLLOW, libc::STATX_BASIC_STATS)
+            .unwrap();
+        assert_eq!(root.st_mode & libc::S_IFMT, libc::S_IFDIR);
+
+        for name in [b"".as_slice(), b".", b"..", b"a/b"] {
+            let err = access
+                .statat_child(
+                    None,
+                    name,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                    libc::STATX_BASIC_STATS,
+                )
+                .unwrap_err();
+            assert_eq!(err.0, libc::EINVAL, "name: {:?}", name);
+
+            let (stat, whiteout) = access.statat_child_with_whiteout(
+                None,
+                name,
+                libc::AT_SYMLINK_NOFOLLOW,
+                libc::STATX_BASIC_STATS,
+            );
+            assert_eq!(stat.unwrap_err().0, libc::EINVAL, "name: {:?}", name);
+            assert!(!whiteout, "name: {:?}", name);
+        }
     }
 }
