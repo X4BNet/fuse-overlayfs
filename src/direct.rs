@@ -144,6 +144,24 @@ impl DataSource for DirectAccess {
         crate::sys::fs::fstatat(dirfd, &c_name, flags)
     }
 
+    fn statat_child_with_whiteout(
+        &self,
+        parent: Option<&SafeFd>,
+        name: &[u8],
+        flags: libc::c_int,
+        mask: libc::c_uint,
+    ) -> (FsResult<libc::stat>, bool) {
+        if name.contains(&b'/') {
+            return (Err(FsError(libc::EINVAL)), false);
+        }
+        let stat = self.statat_child(parent, name, flags, mask);
+        let mut whiteout = Vec::with_capacity(4 + name.len());
+        whiteout.extend_from_slice(b".wh.");
+        whiteout.extend_from_slice(name);
+        let dirfd = parent.map(SafeFd::as_raw_fd).unwrap_or(self.fd());
+        (stat, openat2::file_exists_at(dirfd, &whiteout))
+    }
+
     fn fstat(&self, fd: RawFd, _path: &[u8], mask: libc::c_uint) -> FsResult<libc::stat> {
         let empty = CString::new("").expect("empty CString");
 
@@ -270,6 +288,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("parent")).unwrap();
         std::fs::write(temp.path().join("parent/file"), b"data").unwrap();
+        std::fs::write(temp.path().join("parent/.wh.missing"), b"").unwrap();
 
         let mut access = new();
         access
@@ -297,5 +316,14 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.0, libc::EINVAL);
+
+        let (missing, whiteout) = access.statat_child_with_whiteout(
+            Some(&parent),
+            b"missing",
+            libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_BASIC_STATS,
+        );
+        assert_eq!(missing.unwrap_err().0, libc::ENOENT);
+        assert!(whiteout);
     }
 }

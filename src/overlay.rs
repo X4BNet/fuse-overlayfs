@@ -681,19 +681,6 @@ impl OverlayInner {
         }
     }
 
-    /// Check if an entry is whiteout via .wh.<name> file on a given layer.
-    fn is_wh_file(&self, layer_idx: usize, parent_path: &[u8], name: &[u8]) -> bool {
-        let mut wh_path = if parent_path == b"." {
-            b".wh.".to_vec()
-        } else {
-            let mut p = parent_path.to_vec();
-            p.extend_from_slice(b"/.wh.");
-            p
-        };
-        wh_path.extend_from_slice(name);
-        matches!(self.layers[layer_idx].ds.file_exists(&wh_path), Ok(true))
-    }
-
     /// Check if a name is a .wh. prefix whiteout entry (e.g. ".wh.foo" whiteouts "foo").
     /// Returns the whited-out name, or None if not a whiteout prefix.
     fn wh_prefix_name(name: &[u8]) -> Option<&[u8]> {
@@ -1204,6 +1191,7 @@ impl OverlayInner {
         let last_layer_idx = self.dir_last_layer(parent_id)?;
         let mut found_node: Option<OvlNode> = None;
         let mut stop_lookup = false;
+        let child_path = Self::child_path(&parent_path, name);
 
         for layer_idx in 0..self.layers.len() {
             if stop_lookup {
@@ -1213,13 +1201,35 @@ impl OverlayInner {
                 stop_lookup = true;
             }
 
-            let path = Self::child_path(&parent_path, name);
-
-            let stat_result = self.layers[layer_idx].ds.statat(
-                &path,
-                libc::AT_SYMLINK_NOFOLLOW,
-                sstatx::STATX_TYPE | sstatx::STATX_MODE | sstatx::STATX_NLINK | sstatx::STATX_INO,
-            );
+            let parent_fd = if parent_id == self.root_id {
+                Ok(None)
+            } else {
+                self.cached_parent_fd(layer_idx, parent_id).map(Some)
+            };
+            let (stat_result, has_whiteout) = match parent_fd {
+                Err(e) => (Err(e), false),
+                Ok(parent_fd) if found_node.is_some() => (
+                    self.layers[layer_idx].ds.statat_child(
+                        parent_fd.as_deref(),
+                        name,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                        sstatx::STATX_TYPE
+                            | sstatx::STATX_MODE
+                            | sstatx::STATX_NLINK
+                            | sstatx::STATX_INO,
+                    ),
+                    false,
+                ),
+                Ok(parent_fd) => self.layers[layer_idx].ds.statat_child_with_whiteout(
+                    parent_fd.as_deref(),
+                    name,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                    sstatx::STATX_TYPE
+                        | sstatx::STATX_MODE
+                        | sstatx::STATX_NLINK
+                        | sstatx::STATX_INO,
+                ),
+            };
 
             match stat_result {
                 Err(e) if e.0 == libc::ENOENT || e.0 == libc::ENOTDIR || e.0 == libc::EACCES => {
@@ -1227,7 +1237,7 @@ impl OverlayInner {
                         continue;
                     }
                     // Whiteout found: record in parent's whiteout set and stop
-                    if self.is_wh_file(layer_idx, &parent_path, name) {
+                    if has_whiteout {
                         if let Some(parent) = self.nodes.get_mut(&parent_id) {
                             parent.insert_whiteout(name.to_vec());
                         }
@@ -1246,7 +1256,7 @@ impl OverlayInner {
                     }
 
                     // Whiteout found: record in parent's whiteout set and stop
-                    if self.is_wh_file(layer_idx, &parent_path, name) {
+                    if has_whiteout {
                         if let Some(parent) = self.nodes.get_mut(&parent_id) {
                             parent.insert_whiteout(name.to_vec());
                         }
@@ -1283,7 +1293,7 @@ impl OverlayInner {
                         && matches!(
                             whiteout::is_directory_opaque(
                                 self.layers[layer_idx].ds.as_ref(),
-                                &path
+                                &child_path
                             ),
                             Ok(true)
                         )
