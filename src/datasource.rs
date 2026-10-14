@@ -48,6 +48,16 @@ pub trait DataSource: Send + Sync {
     /// Stat a file relative to the layer root.
     fn statat(&self, path: &[u8], flags: libc::c_int, mask: libc::c_uint) -> FsResult<libc::stat>;
 
+    /// Stat a basename relative to a safely opened parent directory.  `None`
+    /// uses the layer root.  Implementations must reject multi-component names.
+    fn statat_child(
+        &self,
+        parent: Option<&SafeFd>,
+        name: &[u8],
+        flags: libc::c_int,
+        mask: libc::c_uint,
+    ) -> FsResult<libc::stat>;
+
     /// Stat an open file descriptor.
     fn fstat(&self, fd: RawFd, path: &[u8], mask: libc::c_uint) -> FsResult<libc::stat>;
 

@@ -117,11 +117,21 @@ impl DataSource for DirectAccess {
     fn statat(&self, path: &[u8], flags: libc::c_int, mask: libc::c_uint) -> FsResult<libc::stat> {
         // Open parent safely to prevent symlink traversal in intermediate components
         let (parent_fd, basename) = openat2::open_parent_safe(self.fd(), path)?;
-        let dirfd = parent_fd
-            .as_ref()
-            .map(|f| f.as_raw_fd())
-            .unwrap_or(self.fd());
-        let c_name = crate::error::cstr_bytes(basename)?;
+        self.statat_child(parent_fd.as_ref(), basename, flags, mask)
+    }
+
+    fn statat_child(
+        &self,
+        parent: Option<&SafeFd>,
+        name: &[u8],
+        flags: libc::c_int,
+        mask: libc::c_uint,
+    ) -> FsResult<libc::stat> {
+        if name.contains(&b'/') {
+            return Err(FsError(libc::EINVAL));
+        }
+        let dirfd = parent.map(SafeFd::as_raw_fd).unwrap_or(self.fd());
+        let c_name = crate::error::cstr_bytes(name)?;
 
         match crate::sys::fs::statx(dirfd, &c_name, libc::AT_STATX_DONT_SYNC | flags, mask) {
             Ok(stx) => return Ok(crate::sys::statx::statx_to_stat(&stx)),
@@ -248,5 +258,44 @@ pub fn new() -> DirectAccess {
         stat_override: StatOverrideMode::None,
         nfs_fh: 0,
         fh_size: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_statat_child_uses_safe_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("parent")).unwrap();
+        std::fs::write(temp.path().join("parent/file"), b"data").unwrap();
+
+        let mut access = new();
+        access
+            .load_data_source(temp.path().to_str().unwrap())
+            .unwrap();
+        let parent = access
+            .openat(b"parent", libc::O_PATH | libc::O_DIRECTORY, 0)
+            .unwrap();
+        let st = access
+            .statat_child(
+                Some(&parent),
+                b"file",
+                libc::AT_SYMLINK_NOFOLLOW,
+                libc::STATX_BASIC_STATS,
+            )
+            .unwrap();
+        assert_eq!(st.st_size, 4);
+
+        let err = access
+            .statat_child(
+                Some(&parent),
+                b"../file",
+                libc::AT_SYMLINK_NOFOLLOW,
+                libc::STATX_BASIC_STATS,
+            )
+            .unwrap_err();
+        assert_eq!(err.0, libc::EINVAL);
     }
 }

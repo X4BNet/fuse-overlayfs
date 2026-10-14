@@ -43,8 +43,8 @@ macro_rules! cstring {
         crate::error::cstr($s)?
     };
 }
-use crate::sys::openat2::open_parent_safe_cstr as safe_parent;
-use parking_lot::RwLock;
+use crate::sys::openat2::{SafeFd, open_parent_safe_cstr as safe_parent};
+use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 use std::ffi::{CString, OsStr};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -115,11 +115,82 @@ struct OverlayInner {
     inodes: InodeTable,
     nodes: NodeArena,
     root_id: NodeId,
+    parent_fds: Mutex<ParentFdCache>,
     workdir_fd: RawFd,
     ino_passthrough: bool,
     overflow: OverflowIds,
     wd_counter: u64,
     can_mknod: bool,
+}
+
+const PARENT_FD_CACHE_CAPACITY: usize = 512;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ParentFdKey {
+    layer_idx: usize,
+    node_id: NodeId,
+}
+
+struct ParentFdEntry {
+    fd: Arc<SafeFd>,
+    last_used: u64,
+}
+
+/// Bounded LRU of safely opened directory descriptors.  Arc keeps an evicted
+/// descriptor alive until any stat already using it completes.
+struct ParentFdCache {
+    entries: FxHashMap<ParentFdKey, ParentFdEntry>,
+    capacity: usize,
+    clock: u64,
+}
+
+impl ParentFdCache {
+    fn new(capacity: usize) -> Self {
+        ParentFdCache {
+            entries: FxHashMap::default(),
+            capacity,
+            clock: 0,
+        }
+    }
+
+    fn next_stamp(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1);
+        self.clock
+    }
+
+    fn get(&mut self, key: ParentFdKey) -> Option<Arc<SafeFd>> {
+        let stamp = self.next_stamp();
+        let entry = self.entries.get_mut(&key)?;
+        entry.last_used = stamp;
+        Some(entry.fd.clone())
+    }
+
+    fn insert(&mut self, key: ParentFdKey, fd: Arc<SafeFd>) -> Arc<SafeFd> {
+        if self.capacity == 0 {
+            return fd;
+        }
+        if let Some(existing) = self.get(key) {
+            return existing;
+        }
+        if self.entries.len() >= self.capacity
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key)
+        {
+            self.entries.remove(&oldest);
+        }
+        let stamp = self.next_stamp();
+        self.entries.insert(
+            key,
+            ParentFdEntry {
+                fd: fd.clone(),
+                last_used: stamp,
+            },
+        );
+        fd
+    }
 }
 
 struct DirHandle {
@@ -158,6 +229,7 @@ impl OverlayFs {
                 inodes,
                 nodes,
                 root_id,
+                parent_fds: Mutex::new(ParentFdCache::new(PARENT_FD_CACHE_CAPACITY)),
                 workdir_fd,
                 ino_passthrough,
                 overflow,
@@ -442,6 +514,28 @@ impl OverlayInner {
         node::compute_path(&self.nodes, id)
     }
 
+    /// Return a safely opened directory FD, reusing a bounded LRU entry when
+    /// possible.  Opening occurs outside the cache lock so unrelated hits are
+    /// not blocked on openat2.
+    fn cached_parent_fd(&self, layer_idx: usize, parent_id: NodeId) -> FsResult<Arc<SafeFd>> {
+        let key = ParentFdKey {
+            layer_idx,
+            node_id: parent_id,
+        };
+        if let Some(fd) = self.parent_fds.lock().get(key) {
+            return Ok(fd);
+        }
+
+        let layer = self.layer(layer_idx)?;
+        let parent_path = self.node_path(parent_id);
+        let opened = Arc::new(layer.ds.openat(
+            &parent_path,
+            libc::O_PATH | libc::O_DIRECTORY,
+            0,
+        )?);
+        Ok(self.parent_fds.lock().insert(key, opened))
+    }
+
     /// Get a node by id, returning ENOENT on missing.
     fn node(&self, id: &NodeId) -> FsResult<&OvlNode> {
         self.nodes.get(id).ok_or(FsError(libc::ENOENT))
@@ -653,6 +747,24 @@ impl OverlayInner {
             let hp = node.hidden_path.as_deref().unwrap_or("");
             let c_path = crate::error::cstr(hp)?;
             return crate::sys::fs::fstatat(node.hidden_dirfd, &c_path, libc::AT_SYMLINK_NOFOLLOW);
+        }
+
+        if let Some(parent_id) = node.parent {
+            if parent_id == self.root_id {
+                return layer.ds.statat_child(
+                    None,
+                    &node.name,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                    sstatx::STATX_BASIC_STATS,
+                );
+            }
+            let parent_fd = self.cached_parent_fd(node.layer_idx, parent_id)?;
+            return layer.ds.statat_child(
+                Some(parent_fd.as_ref()),
+                &node.name,
+                libc::AT_SYMLINK_NOFOLLOW,
+                sstatx::STATX_BASIC_STATS,
+            );
         }
         layer
             .ds
@@ -4037,6 +4149,47 @@ fn parse_device(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parent_fd_cache_evicts_least_recently_used() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::sys::openat2::open_trusted(
+            temp.path().to_str().unwrap(),
+            libc::O_PATH | libc::O_DIRECTORY,
+            0,
+        )
+        .unwrap();
+        let fd = Arc::new(
+            crate::sys::openat2::safe_openat(
+                root.as_raw_fd(),
+                b".",
+                libc::O_PATH | libc::O_DIRECTORY,
+                0,
+            )
+            .unwrap(),
+        );
+        let key1 = ParentFdKey {
+            layer_idx: 0,
+            node_id: NodeId(1),
+        };
+        let key2 = ParentFdKey {
+            layer_idx: 0,
+            node_id: NodeId(2),
+        };
+        let key3 = ParentFdKey {
+            layer_idx: 1,
+            node_id: NodeId(1),
+        };
+        let mut cache = ParentFdCache::new(2);
+        cache.insert(key1, fd.clone());
+        cache.insert(key2, fd.clone());
+        assert!(cache.get(key1).is_some());
+        cache.insert(key3, fd);
+
+        assert!(cache.get(key1).is_some());
+        assert!(cache.get(key2).is_none());
+        assert!(cache.get(key3).is_some());
+    }
 
     #[test]
     fn test_dtype_to_mode() {
