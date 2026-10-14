@@ -30,7 +30,10 @@ pub struct OverlayConfig {
 
     pub threaded: bool,
     pub fsync: bool,
-    pub fast_ino_check: bool,
+    /// A legacy fast inode option was supplied.  Metadata loading is now
+    /// deferred unconditionally; this is retained only to warn users without
+    /// breaking existing mount command lines.
+    pub deprecated_fast_ino: bool,
     pub writeback: bool,
     pub disable_xattrs: bool,
 
@@ -72,7 +75,7 @@ impl Default for OverlayConfig {
             nfs_filehandles: 0,
             threaded: false,
             fsync: true,
-            fast_ino_check: false,
+            deprecated_fast_ino: false,
             writeback: true,
             disable_xattrs: false,
             squash_to_uid: None,
@@ -296,10 +299,10 @@ fn parse_single_option(opt: &str, config: &mut OverlayConfig) -> Result<(), Stri
                     != 0;
             }
             "fast_ino" | "fast_ino_check" => {
-                config.fast_ino_check = value
+                value
                     .parse::<i32>()
-                    .map_err(|_| format!("invalid fast_ino value: {}", value))?
-                    != 0;
+                    .map_err(|_| format!("invalid fast_ino value: {}", value))?;
+                config.deprecated_fast_ino = true;
             }
             "writeback" => {
                 config.writeback = value
@@ -544,5 +547,28 @@ mod tests {
         let config = parse_args(&args).unwrap();
         assert_eq!(config.lowerdir.as_deref(), Some("/lower"));
         assert_eq!(config.upperdir.as_deref(), Some("/upper"));
+    }
+
+    #[test]
+    fn test_parse_args_accepts_deprecated_fast_ino() {
+        let args: Vec<String> = vec![
+            "fuse-overlayfs".into(),
+            "-o".into(),
+            "fast_ino_check=1,lowerdir=/lower".into(),
+            "/mnt".into(),
+        ];
+        let config = parse_args(&args).unwrap();
+        assert!(config.deprecated_fast_ino);
+    }
+
+    #[test]
+    fn test_parse_args_rejects_invalid_deprecated_fast_ino() {
+        let args: Vec<String> = vec![
+            "fuse-overlayfs".into(),
+            "-o".into(),
+            "fast_ino=invalid,lowerdir=/lower".into(),
+            "/mnt".into(),
+        ];
+        assert!(parse_args(&args).is_err());
     }
 }
