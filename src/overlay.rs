@@ -1388,7 +1388,9 @@ impl OverlayInner {
             name: b"..".to_vec(),
             ino: parent_ino,
             mode: libc::S_IFDIR,
-            node_id: parent_id,
+            // The root has no parent node, but its ".." entry still refers to
+            // the root and needs real attributes during readdirplus.
+            node_id: Some(parent_id.unwrap_or(node_id)),
         });
 
         // Own names so the handle remains valid if the in-memory tree changes.
@@ -3622,63 +3624,51 @@ impl Filesystem for OverlayFs {
             .iter()
             .enumerate()
             .skip(offset)
-            .map(|(i, e)| (i, e.name.clone(), e.ino, e.mode, e.node_id))
+            .map(|(i, e)| (i, e.name.clone(), e.node_id))
             .collect();
         drop(dirs);
 
         // Hydrate and register entries in inode table so FUSE inodes match what
         // lookup would return.  Ordinary readdir never enters this path.
         let mut inner = self.inner.write();
-        for (i, name, raw_ino, mode, node_id) in &entries {
-            let attr = node_id.and_then(|nid| {
-                inner
-                    .rpl_stat_cached(nid, -1, &self.config)
-                    .ok()
-                    .map(|st| stat_to_attr(&st))
-            });
+        for (i, name, node_id) in &entries {
+            let Some(nid) = node_id else {
+                debug!(
+                    "readdirplus: skipping {:?} without a backing node",
+                    String::from_utf8_lossy(name)
+                );
+                continue;
+            };
 
-            let (fuse_ino, lookup_key) = if let Some(nid) = node_id {
-                if let Some(node) = inner.nodes.get(nid) {
-                    let tmp_ino = node.tmp_ino;
-                    let tmp_dev = node.tmp_dev;
-                    let nmode = node.mode;
-                    let is_lower = inner.layers[node.layer_idx].low;
-                    let oi = &mut *inner;
-                    if let Some((ino_val, key)) = oi
-                        .inodes
-                        .register(&oi.nodes, *nid, tmp_ino, tmp_dev, nmode, is_lower)
-                    {
-                        (ino_val, Some(key))
-                    } else {
-                        (*raw_ino, None)
-                    }
-                } else {
-                    (*raw_ino, None)
+            let st = match inner.rpl_stat_cached(*nid, -1, &self.config) {
+                Ok(st) => st,
+                Err(e) => {
+                    debug!(
+                        "readdirplus: skipping {:?} after stat failed: {}",
+                        String::from_utf8_lossy(name),
+                        e.0
+                    );
+                    continue;
                 }
-            } else {
-                (*raw_ino, None)
             };
 
-            let mut a = match attr {
-                Some(a) => a,
-                None => FileAttr {
-                    ino: INodeNo(fuse_ino),
-                    size: 0,
-                    blocks: 0,
-                    atime: UNIX_EPOCH,
-                    mtime: UNIX_EPOCH,
-                    ctime: UNIX_EPOCH,
-                    crtime: UNIX_EPOCH,
-                    kind: mode_to_filetype(*mode),
-                    perm: 0o755,
-                    nlink: 1,
-                    uid: 0,
-                    gid: 0,
-                    rdev: 0,
-                    blksize: 4096,
-                    flags: 0,
-                },
+            let node = match inner.nodes.get(nid) {
+                Some(node) => node,
+                None => continue,
             };
+            let tmp_ino = node.tmp_ino;
+            let tmp_dev = node.tmp_dev;
+            let nmode = node.mode;
+            let is_lower = inner.layers[node.layer_idx].low;
+            let oi = &mut *inner;
+            let Some((fuse_ino, lookup_key)) = oi
+                .inodes
+                .register(&oi.nodes, *nid, tmp_ino, tmp_dev, nmode, is_lower)
+            else {
+                continue;
+            };
+
+            let mut a = stat_to_attr(&st);
             a.ino = INodeNo(fuse_ino);
             let entry_ttl = if inner.inodes.is_underlying_hardlink(fuse_ino) {
                 Duration::ZERO
@@ -3695,9 +3685,7 @@ impl Filesystem for OverlayFs {
             ) {
                 break;
             }
-            if let Some(key) = lookup_key {
-                inner.inodes.inc_lookup(&key);
-            }
+            inner.inodes.inc_lookup(&lookup_key);
         }
         reply.ok();
     }
@@ -4177,7 +4165,10 @@ mod tests {
         let entries = inner.build_dir_entries(root_id, &OverlayConfig::default());
 
         assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].node_id, Some(root_id));
+        assert_eq!(entries[1].node_id, Some(root_id));
         assert_eq!(entries[2].name, b"child");
+        assert_eq!(entries[2].node_id, Some(child_id));
         assert_eq!(entries[2].ino, 42);
         assert_eq!(entries[2].mode, libc::S_IFREG);
         assert!(!inner.nodes.get(&child_id).unwrap().metadata_valid);
