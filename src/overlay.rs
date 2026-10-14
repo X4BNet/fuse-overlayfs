@@ -596,6 +596,14 @@ impl OverlayInner {
         }
     }
 
+    /// Collect names hidden by prefix whiteouts in a directory listing.
+    fn collect_prefix_whiteouts(entries: &[datasource::DirEntry]) -> Vec<Vec<u8>> {
+        entries
+            .iter()
+            .filter_map(|entry| Self::wh_prefix_name(&entry.name).map(<[u8]>::to_vec))
+            .collect()
+    }
+
     /// Check if a stat result represents a char device (0,0) whiteout.
     fn is_chardev_whiteout(st: &libc::stat) -> bool {
         (st.st_mode & libc::S_IFMT) == libc::S_IFCHR
@@ -841,7 +849,31 @@ impl OverlayInner {
                 Err(_) => continue,
             };
 
+            let mut entries = Vec::new();
             while let Some(entry) = dir.next_entry() {
+                entries.push(entry);
+            }
+
+            // Record prefix whiteouts before processing normal entries.  The
+            // directory listing already contains every .wh.<name> marker, so
+            // probing for a corresponding marker once per normal entry would
+            // only repeat filesystem lookups.  Doing this as a separate pass
+            // also makes the result independent of readdir ordering.
+            for whited_name in Self::collect_prefix_whiteouts(&entries) {
+                // A lower-layer whiteout must not hide an entry already found
+                // in a higher layer.
+                if self
+                    .nodes
+                    .get(&parent_id)
+                    .and_then(|p| p.get_child(&whited_name))
+                    .is_none()
+                    && let Some(parent) = self.nodes.get_mut(&parent_id)
+                {
+                    parent.insert_whiteout(whited_name);
+                }
+            }
+
+            for entry in entries {
                 if entry.name == b"."
                     || entry.name == b".."
                     || entry.name == xattr::OPAQUE_WHITEOUT.as_bytes()
@@ -871,28 +903,9 @@ impl OverlayInner {
                     continue;
                 }
 
-                // Check for .wh.<name> file whiteout
-                if self.is_wh_file(layer_idx, path, &entry.name) {
-                    if let Some(parent) = self.nodes.get_mut(&parent_id) {
-                        parent.insert_whiteout(entry.name);
-                    }
-                    continue;
-                }
-
-                // Check if entry itself is a .wh. prefix whiteout
-                if let Some(whited_name) = Self::wh_prefix_name(&entry.name) {
-                    // If the whited-out name already exists from a higher layer, skip
-                    if self
-                        .nodes
-                        .get(&parent_id)
-                        .and_then(|p| p.get_child(whited_name))
-                        .is_some()
-                    {
-                        continue;
-                    }
-                    if let Some(parent) = self.nodes.get_mut(&parent_id) {
-                        parent.insert_whiteout(whited_name.to_vec());
-                    }
+                // Prefix whiteouts were recorded in the first pass and must
+                // never be exposed as normal overlay entries.
+                if Self::wh_prefix_name(&entry.name).is_some() {
                     continue;
                 }
 
@@ -3942,6 +3955,37 @@ fn parse_device(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_collect_prefix_whiteouts_is_order_independent() {
+        let entries = vec![
+            datasource::DirEntry {
+                name: b"visible".to_vec(),
+                ino: 1,
+                dtype: libc::DT_REG,
+            },
+            datasource::DirEntry {
+                name: b".wh.hidden".to_vec(),
+                ino: 2,
+                dtype: libc::DT_REG,
+            },
+            datasource::DirEntry {
+                name: xattr::OPAQUE_WHITEOUT.as_bytes().to_vec(),
+                ino: 3,
+                dtype: libc::DT_REG,
+            },
+            datasource::DirEntry {
+                name: b".wh.before".to_vec(),
+                ino: 4,
+                dtype: libc::DT_REG,
+            },
+        ];
+
+        assert_eq!(
+            OverlayInner::collect_prefix_whiteouts(&entries),
+            vec![b"hidden".to_vec(), b"before".to_vec()]
+        );
+    }
 
     #[test]
     fn test_parse_override_3_fields() {
