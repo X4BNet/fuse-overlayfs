@@ -139,7 +139,7 @@ impl DataSource for DirectAccess {
 
         match crate::sys::fs::statx(dirfd, &c_name, libc::AT_STATX_DONT_SYNC | flags, mask) {
             Ok(stx) => return Ok(crate::sys::statx::statx_to_stat(&stx)),
-            Err(FsError(e)) if e == libc::ENOSYS || e == libc::EINVAL => {
+            Err(FsError(e)) if should_fallback_from_statx(e) => {
                 // Fall through to fstatat
             }
             Err(e) => return Err(e),
@@ -176,7 +176,7 @@ impl DataSource for DirectAccess {
             mask,
         ) {
             Ok(stx) => return Ok(crate::sys::statx::statx_to_stat(&stx)),
-            Err(FsError(e)) if e == libc::ENOSYS || e == libc::EINVAL => {
+            Err(FsError(e)) if should_fallback_from_statx(e) => {
                 // Fall through to fstat
             }
             Err(e) => return Err(e),
@@ -274,6 +274,11 @@ fn validate_child_name(name: &[u8]) -> FsResult<()> {
     Ok(())
 }
 
+/// Return whether a filesystem rejected `statx` but may support legacy stat calls.
+fn should_fallback_from_statx(errno: libc::c_int) -> bool {
+    errno == libc::ENOSYS || errno == libc::EINVAL || errno == libc::EOPNOTSUPP
+}
+
 impl DirectAccess {
     /// Override the detected stat override mode (used when xattr_permissions is configured).
     pub fn set_stat_override(&mut self, mode: StatOverrideMode) {
@@ -296,6 +301,16 @@ pub fn new() -> DirectAccess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_statx_unsupported_errors_use_legacy_fallback() {
+        for errno in [libc::ENOSYS, libc::EINVAL, libc::EOPNOTSUPP] {
+            assert!(should_fallback_from_statx(errno));
+        }
+
+        assert!(!should_fallback_from_statx(libc::ENOENT));
+        assert!(!should_fallback_from_statx(libc::EACCES));
+    }
 
     #[test]
     fn test_statat_child_uses_safe_parent() {
