@@ -205,6 +205,13 @@ pub fn parse_args(args: &[String]) -> Result<OverlayConfig, String> {
         config.fsync = false;
     }
 
+    // POSIX ACLs are transported through xattrs. Advertising ACL support
+    // while xattrs are disabled makes the kernel's permission checks fail
+    // with EOPNOTSUPP on filesystems such as NFS.
+    if config.disable_xattrs {
+        config.noacl = true;
+    }
+
     // Parse timeout from string if provided
     // (the C code stores it as a string via fuse_opt, then calls atof)
 
@@ -532,6 +539,19 @@ mod tests {
         let config = parse_args(&args).unwrap();
         assert!(config.volatile_mode);
         assert!(!config.fsync);
+    }
+
+    #[test]
+    fn test_parse_args_noxattrs_disables_acl_support() {
+        let args: Vec<String> = vec![
+            "fuse-overlayfs".into(),
+            "-o".into(),
+            "noxattrs=1,lowerdir=/a".into(),
+            "/mnt".into(),
+        ];
+        let config = parse_args(&args).unwrap();
+        assert!(config.disable_xattrs);
+        assert!(config.noacl);
     }
 
     #[test]
