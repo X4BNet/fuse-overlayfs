@@ -58,6 +58,12 @@ fn main() {
             .init();
     }
 
+    if config.deprecated_fast_ino {
+        warn!(
+            "fast_ino/fast_ino_check is deprecated and has no effect; metadata loading is always deferred"
+        );
+    }
+
     // Validate required options
     let lowerdir = match &config.lowerdir {
         Some(l) => l.clone(),

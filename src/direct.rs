@@ -115,23 +115,55 @@ impl DataSource for DirectAccess {
     }
 
     fn statat(&self, path: &[u8], flags: libc::c_int, mask: libc::c_uint) -> FsResult<libc::stat> {
+        // The synthetic overlay root is represented by ".".  It is already a
+        // safely opened layer descriptor, so stat it directly rather than
+        // weakening the child-basename validator to admit dot components.
+        if path == b"." {
+            return self.fstat(self.fd(), path, mask);
+        }
         // Open parent safely to prevent symlink traversal in intermediate components
         let (parent_fd, basename) = openat2::open_parent_safe(self.fd(), path)?;
-        let dirfd = parent_fd
-            .as_ref()
-            .map(|f| f.as_raw_fd())
-            .unwrap_or(self.fd());
-        let c_name = crate::error::cstr_bytes(basename)?;
+        self.statat_child(parent_fd.as_ref(), basename, flags, mask)
+    }
+
+    fn statat_child(
+        &self,
+        parent: Option<&SafeFd>,
+        name: &[u8],
+        flags: libc::c_int,
+        mask: libc::c_uint,
+    ) -> FsResult<libc::stat> {
+        validate_child_name(name)?;
+        let dirfd = parent.map(SafeFd::as_raw_fd).unwrap_or(self.fd());
+        let c_name = crate::error::cstr_bytes(name)?;
 
         match crate::sys::fs::statx(dirfd, &c_name, libc::AT_STATX_DONT_SYNC | flags, mask) {
             Ok(stx) => return Ok(crate::sys::statx::statx_to_stat(&stx)),
-            Err(FsError(e)) if e == libc::ENOSYS || e == libc::EINVAL => {
+            Err(FsError(e)) if should_fallback_from_statx(e) => {
                 // Fall through to fstatat
             }
             Err(e) => return Err(e),
         }
 
         crate::sys::fs::fstatat(dirfd, &c_name, flags)
+    }
+
+    fn statat_child_with_whiteout(
+        &self,
+        parent: Option<&SafeFd>,
+        name: &[u8],
+        flags: libc::c_int,
+        mask: libc::c_uint,
+    ) -> (FsResult<libc::stat>, bool) {
+        if let Err(e) = validate_child_name(name) {
+            return (Err(e), false);
+        }
+        let stat = self.statat_child(parent, name, flags, mask);
+        let mut whiteout = Vec::with_capacity(4 + name.len());
+        whiteout.extend_from_slice(b".wh.");
+        whiteout.extend_from_slice(name);
+        let dirfd = parent.map(SafeFd::as_raw_fd).unwrap_or(self.fd());
+        (stat, openat2::file_exists_at(dirfd, &whiteout))
     }
 
     fn fstat(&self, fd: RawFd, _path: &[u8], mask: libc::c_uint) -> FsResult<libc::stat> {
@@ -144,7 +176,7 @@ impl DataSource for DirectAccess {
             mask,
         ) {
             Ok(stx) => return Ok(crate::sys::statx::statx_to_stat(&stx)),
-            Err(FsError(e)) if e == libc::ENOSYS || e == libc::EINVAL => {
+            Err(FsError(e)) if should_fallback_from_statx(e) => {
                 // Fall through to fstat
             }
             Err(e) => return Err(e),
@@ -232,6 +264,21 @@ impl DataSource for DirectAccess {
     }
 }
 
+/// Validate a name before using it with an `*at` syscall.  Slash-free dot
+/// components are not safe basenames: `..` would escape the supplied parent
+/// descriptor and `.` would address the parent itself.
+fn validate_child_name(name: &[u8]) -> FsResult<()> {
+    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
+        return Err(FsError(libc::EINVAL));
+    }
+    Ok(())
+}
+
+/// Return whether a filesystem rejected `statx` but may support legacy stat calls.
+fn should_fallback_from_statx(errno: libc::c_int) -> bool {
+    errno == libc::ENOSYS || errno == libc::EINVAL || errno == libc::EOPNOTSUPP
+}
+
 impl DirectAccess {
     /// Override the detected stat override mode (used when xattr_permissions is configured).
     pub fn set_stat_override(&mut self, mode: StatOverrideMode) {
@@ -248,5 +295,99 @@ pub fn new() -> DirectAccess {
         stat_override: StatOverrideMode::None,
         nfs_fh: 0,
         fh_size: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_statx_unsupported_errors_use_legacy_fallback() {
+        for errno in [libc::ENOSYS, libc::EINVAL, libc::EOPNOTSUPP] {
+            assert!(should_fallback_from_statx(errno));
+        }
+
+        assert!(!should_fallback_from_statx(libc::ENOENT));
+        assert!(!should_fallback_from_statx(libc::EACCES));
+    }
+
+    #[test]
+    fn test_statat_child_uses_safe_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("parent")).unwrap();
+        std::fs::write(temp.path().join("parent/file"), b"data").unwrap();
+        std::fs::write(temp.path().join("parent/.wh.missing"), b"").unwrap();
+
+        let mut access = new();
+        access
+            .load_data_source(temp.path().to_str().unwrap())
+            .unwrap();
+        let parent = access
+            .openat(b"parent", libc::O_PATH | libc::O_DIRECTORY, 0)
+            .unwrap();
+        let st = access
+            .statat_child(
+                Some(&parent),
+                b"file",
+                libc::AT_SYMLINK_NOFOLLOW,
+                libc::STATX_BASIC_STATS,
+            )
+            .unwrap();
+        assert_eq!(st.st_size, 4);
+
+        let err = access
+            .statat_child(
+                Some(&parent),
+                b"../file",
+                libc::AT_SYMLINK_NOFOLLOW,
+                libc::STATX_BASIC_STATS,
+            )
+            .unwrap_err();
+        assert_eq!(err.0, libc::EINVAL);
+
+        let (missing, whiteout) = access.statat_child_with_whiteout(
+            Some(&parent),
+            b"missing",
+            libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_BASIC_STATS,
+        );
+        assert_eq!(missing.unwrap_err().0, libc::ENOENT);
+        assert!(whiteout);
+    }
+
+    #[test]
+    fn test_statat_child_rejects_unsafe_basenames() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut access = new();
+        access
+            .load_data_source(temp.path().to_str().unwrap())
+            .unwrap();
+
+        let root = access
+            .statat(b".", libc::AT_SYMLINK_NOFOLLOW, libc::STATX_BASIC_STATS)
+            .unwrap();
+        assert_eq!(root.st_mode & libc::S_IFMT, libc::S_IFDIR);
+
+        for name in [b"".as_slice(), b".", b"..", b"a/b"] {
+            let err = access
+                .statat_child(
+                    None,
+                    name,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                    libc::STATX_BASIC_STATS,
+                )
+                .unwrap_err();
+            assert_eq!(err.0, libc::EINVAL, "name: {:?}", name);
+
+            let (stat, whiteout) = access.statat_child_with_whiteout(
+                None,
+                name,
+                libc::AT_SYMLINK_NOFOLLOW,
+                libc::STATX_BASIC_STATS,
+            );
+            assert_eq!(stat.unwrap_err().0, libc::EINVAL, "name: {:?}", name);
+            assert!(!whiteout, "name: {:?}", name);
+        }
     }
 }

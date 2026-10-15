@@ -43,8 +43,8 @@ macro_rules! cstring {
         crate::error::cstr($s)?
     };
 }
-use crate::sys::openat2::open_parent_safe_cstr as safe_parent;
-use parking_lot::RwLock;
+use crate::sys::openat2::{SafeFd, open_parent_safe_cstr as safe_parent};
+use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 use std::ffi::{CString, OsStr};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -115,11 +115,82 @@ struct OverlayInner {
     inodes: InodeTable,
     nodes: NodeArena,
     root_id: NodeId,
+    parent_fds: Mutex<ParentFdCache>,
     workdir_fd: RawFd,
     ino_passthrough: bool,
     overflow: OverflowIds,
     wd_counter: u64,
     can_mknod: bool,
+}
+
+const PARENT_FD_CACHE_CAPACITY: usize = 512;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ParentFdKey {
+    layer_idx: usize,
+    node_id: NodeId,
+}
+
+struct ParentFdEntry {
+    fd: Arc<SafeFd>,
+    last_used: u64,
+}
+
+/// Bounded LRU of safely opened directory descriptors.  Arc keeps an evicted
+/// descriptor alive until any stat already using it completes.
+struct ParentFdCache {
+    entries: FxHashMap<ParentFdKey, ParentFdEntry>,
+    capacity: usize,
+    clock: u64,
+}
+
+impl ParentFdCache {
+    fn new(capacity: usize) -> Self {
+        ParentFdCache {
+            entries: FxHashMap::default(),
+            capacity,
+            clock: 0,
+        }
+    }
+
+    fn next_stamp(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1);
+        self.clock
+    }
+
+    fn get(&mut self, key: ParentFdKey) -> Option<Arc<SafeFd>> {
+        let stamp = self.next_stamp();
+        let entry = self.entries.get_mut(&key)?;
+        entry.last_used = stamp;
+        Some(entry.fd.clone())
+    }
+
+    fn insert(&mut self, key: ParentFdKey, fd: Arc<SafeFd>) -> Arc<SafeFd> {
+        if self.capacity == 0 {
+            return fd;
+        }
+        if let Some(existing) = self.get(key) {
+            return existing;
+        }
+        if self.entries.len() >= self.capacity
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key)
+        {
+            self.entries.remove(&oldest);
+        }
+        let stamp = self.next_stamp();
+        self.entries.insert(
+            key,
+            ParentFdEntry {
+                fd: fd.clone(),
+                last_used: stamp,
+            },
+        );
+        fd
+    }
 }
 
 struct DirHandle {
@@ -130,7 +201,6 @@ struct DirEntry {
     name: Vec<u8>,
     ino: u64,
     mode: u32,
-    attr: Option<FileAttr>,
     node_id: Option<NodeId>,
 }
 
@@ -158,6 +228,7 @@ impl OverlayFs {
                 inodes,
                 nodes,
                 root_id,
+                parent_fds: Mutex::new(ParentFdCache::new(PARENT_FD_CACHE_CAPACITY)),
                 workdir_fd,
                 ino_passthrough,
                 overflow,
@@ -422,10 +493,46 @@ fn mode_to_filetype(mode: u32) -> FileType {
     }
 }
 
+/// Convert a dirent d_type value to the corresponding file-type mode bits.
+fn dtype_to_mode(dtype: u8) -> u32 {
+    match dtype {
+        libc::DT_DIR => libc::S_IFDIR,
+        libc::DT_REG => libc::S_IFREG,
+        libc::DT_LNK => libc::S_IFLNK,
+        libc::DT_BLK => libc::S_IFBLK,
+        libc::DT_CHR => libc::S_IFCHR,
+        libc::DT_FIFO => libc::S_IFIFO,
+        libc::DT_SOCK => libc::S_IFSOCK,
+        _ => 0,
+    }
+}
+
 impl OverlayInner {
     /// Compute the overlay-relative path for a node.
     fn node_path(&self, id: NodeId) -> Vec<u8> {
         node::compute_path(&self.nodes, id)
+    }
+
+    /// Return a safely opened directory FD, reusing a bounded LRU entry when
+    /// possible.  Opening occurs outside the cache lock so unrelated hits are
+    /// not blocked on openat2.
+    fn cached_parent_fd(&self, layer_idx: usize, parent_id: NodeId) -> FsResult<Arc<SafeFd>> {
+        let key = ParentFdKey {
+            layer_idx,
+            node_id: parent_id,
+        };
+        if let Some(fd) = self.parent_fds.lock().get(key) {
+            return Ok(fd);
+        }
+
+        let layer = self.layer(layer_idx)?;
+        let parent_path = self.node_path(parent_id);
+        let opened = Arc::new(layer.ds.openat(
+            &parent_path,
+            libc::O_PATH | libc::O_DIRECTORY,
+            0,
+        )?);
+        Ok(self.parent_fds.lock().insert(key, opened))
     }
 
     /// Get a node by id, returning ENOENT on missing.
@@ -573,19 +680,6 @@ impl OverlayInner {
         }
     }
 
-    /// Check if an entry is whiteout via .wh.<name> file on a given layer.
-    fn is_wh_file(&self, layer_idx: usize, parent_path: &[u8], name: &[u8]) -> bool {
-        let mut wh_path = if parent_path == b"." {
-            b".wh.".to_vec()
-        } else {
-            let mut p = parent_path.to_vec();
-            p.extend_from_slice(b"/.wh.");
-            p
-        };
-        wh_path.extend_from_slice(name);
-        matches!(self.layers[layer_idx].ds.file_exists(&wh_path), Ok(true))
-    }
-
     /// Check if a name is a .wh. prefix whiteout entry (e.g. ".wh.foo" whiteouts "foo").
     /// Returns the whited-out name, or None if not a whiteout prefix.
     fn wh_prefix_name(name: &[u8]) -> Option<&[u8]> {
@@ -594,6 +688,14 @@ impl OverlayInner {
         } else {
             None
         }
+    }
+
+    /// Collect names hidden by prefix whiteouts in a directory listing.
+    fn collect_prefix_whiteouts(entries: &[datasource::DirEntry]) -> Vec<Vec<u8>> {
+        entries
+            .iter()
+            .filter_map(|entry| Self::wh_prefix_name(&entry.name).map(<[u8]>::to_vec))
+            .collect()
     }
 
     /// Check if a stat result represents a char device (0,0) whiteout.
@@ -631,6 +733,24 @@ impl OverlayInner {
             let hp = node.hidden_path.as_deref().unwrap_or("");
             let c_path = crate::error::cstr(hp)?;
             return crate::sys::fs::fstatat(node.hidden_dirfd, &c_path, libc::AT_SYMLINK_NOFOLLOW);
+        }
+
+        if let Some(parent_id) = node.parent {
+            if parent_id == self.root_id {
+                return layer.ds.statat_child(
+                    None,
+                    &node.name,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                    sstatx::STATX_BASIC_STATS,
+                );
+            }
+            let parent_fd = self.cached_parent_fd(node.layer_idx, parent_id)?;
+            return layer.ds.statat_child(
+                Some(parent_fd.as_ref()),
+                &node.name,
+                libc::AT_SYMLINK_NOFOLLOW,
+                sstatx::STATX_BASIC_STATS,
+            );
         }
         layer
             .ds
@@ -682,7 +802,36 @@ impl OverlayInner {
         path: &[u8],
     ) -> FsResult<libc::stat> {
         let node = self.nodes.get(&node_id).ok_or(FsError(libc::ENOENT))?;
-        let mut st = self.do_stat_with_path(node, fd, path)?;
+        let st = self.do_stat_with_path(node, fd, path)?;
+        self.finish_stat_with_path(node_id, fd, config, path, st)
+    }
+
+    /// Full stat that also records metadata for a node created from dirent data.
+    fn rpl_stat_with_path_cached(
+        &mut self,
+        node_id: NodeId,
+        fd: RawFd,
+        config: &OverlayConfig,
+        path: &[u8],
+    ) -> FsResult<libc::stat> {
+        let node = self.nodes.get(&node_id).ok_or(FsError(libc::ENOENT))?;
+        let st = self.do_stat_with_path(node, fd, path)?;
+        if let Some(node) = self.nodes.get_mut(&node_id) {
+            node.hydrate_metadata(&st);
+        }
+        self.finish_stat_with_path(node_id, fd, config, path, st)
+    }
+
+    /// Apply overlay metadata transformations to an underlying stat result.
+    fn finish_stat_with_path(
+        &self,
+        node_id: NodeId,
+        fd: RawFd,
+        config: &OverlayConfig,
+        path: &[u8],
+        mut st: libc::stat,
+    ) -> FsResult<libc::stat> {
+        let node = self.nodes.get(&node_id).ok_or(FsError(libc::ENOENT))?;
 
         // Apply stat override from xattr (must be before UID/GID mapping)
         let layer = self.layer(node.layer_idx)?;
@@ -751,6 +900,26 @@ impl OverlayInner {
         Ok(st)
     }
 
+    /// Full stat with metadata caching (computes path internally).
+    fn rpl_stat_cached(
+        &mut self,
+        node_id: NodeId,
+        fd: RawFd,
+        config: &OverlayConfig,
+    ) -> FsResult<libc::stat> {
+        let node = self.nodes.get(&node_id).ok_or(FsError(libc::ENOENT))?;
+        let path = if node.hidden {
+            node.hidden_path
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes()
+                .to_vec()
+        } else {
+            self.node_path(node_id)
+        };
+        self.rpl_stat_with_path_cached(node_id, fd, config, &path)
+    }
+
     /// Full stat with UID/GID mapping and nlink computation (computes path internally).
     fn rpl_stat(&self, node_id: NodeId, fd: RawFd, config: &OverlayConfig) -> FsResult<libc::stat> {
         let node = self.nodes.get(&node_id).ok_or(FsError(libc::ENOENT))?;
@@ -809,7 +978,7 @@ impl OverlayInner {
         parent_id: NodeId,
         path: &[u8],
         last_layer_stop: Option<usize>,
-        config: &OverlayConfig,
+        _config: &OverlayConfig,
     ) {
         let mut stop_lookup = false;
 
@@ -841,7 +1010,31 @@ impl OverlayInner {
                 Err(_) => continue,
             };
 
+            let mut entries = Vec::new();
             while let Some(entry) = dir.next_entry() {
+                entries.push(entry);
+            }
+
+            // Record prefix whiteouts before processing normal entries.  The
+            // directory listing already contains every .wh.<name> marker, so
+            // probing for a corresponding marker once per normal entry would
+            // only repeat filesystem lookups.  Doing this as a separate pass
+            // also makes the result independent of readdir ordering.
+            for whited_name in Self::collect_prefix_whiteouts(&entries) {
+                // A lower-layer whiteout must not hide an entry already found
+                // in a higher layer.
+                if self
+                    .nodes
+                    .get(&parent_id)
+                    .and_then(|p| p.get_child(&whited_name))
+                    .is_none()
+                    && let Some(parent) = self.nodes.get_mut(&parent_id)
+                {
+                    parent.insert_whiteout(whited_name);
+                }
+            }
+
+            for entry in entries {
                 if entry.name == b"."
                     || entry.name == b".."
                     || entry.name == xattr::OPAQUE_WHITEOUT.as_bytes()
@@ -871,55 +1064,19 @@ impl OverlayInner {
                     continue;
                 }
 
-                // Check for .wh.<name> file whiteout
-                if self.is_wh_file(layer_idx, path, &entry.name) {
-                    if let Some(parent) = self.nodes.get_mut(&parent_id) {
-                        parent.insert_whiteout(entry.name);
-                    }
+                // Prefix whiteouts were recorded in the first pass and must
+                // never be exposed as normal overlay entries.
+                if Self::wh_prefix_name(&entry.name).is_some() {
                     continue;
                 }
 
-                // Check if entry itself is a .wh. prefix whiteout
-                if let Some(whited_name) = Self::wh_prefix_name(&entry.name) {
-                    // If the whited-out name already exists from a higher layer, skip
-                    if self
-                        .nodes
-                        .get(&parent_id)
-                        .and_then(|p| p.get_child(whited_name))
-                        .is_some()
-                    {
-                        continue;
-                    }
-                    if let Some(parent) = self.nodes.get_mut(&parent_id) {
-                        parent.insert_whiteout(whited_name.to_vec());
-                    }
-                    continue;
-                }
-
-                // Check for char device (0,0) whiteout
+                // Character devices must be inspected for overlay whiteout
+                // semantics.  DT_UNKNOWN also needs a stat so directories are
+                // represented with the correct node type.
+                let mut entry_stat = None;
                 if entry.dtype == libc::DT_CHR || entry.dtype == libc::DT_UNKNOWN {
                     let node_path = Self::child_path(path, &entry.name);
                     if let Ok(st) = self.layers[layer_idx].ds.statat(
-                        &node_path,
-                        libc::AT_SYMLINK_NOFOLLOW,
-                        sstatx::STATX_TYPE,
-                    ) && Self::is_chardev_whiteout(&st)
-                    {
-                        if let Some(parent) = self.nodes.get_mut(&parent_id) {
-                            parent.insert_whiteout(entry.name);
-                        }
-                        continue;
-                    }
-                }
-
-                // Normal entry
-                let is_dir = entry.dtype == libc::DT_DIR;
-                let node_path = Self::child_path(path, &entry.name);
-
-                let (ino, dev, mode, nlink) = if config.fast_ino_check {
-                    (entry.ino, 0, if is_dir { libc::S_IFDIR } else { 0 }, 1)
-                } else {
-                    match self.layers[layer_idx].ds.statat(
                         &node_path,
                         libc::AT_SYMLINK_NOFOLLOW,
                         sstatx::STATX_TYPE
@@ -927,20 +1084,42 @@ impl OverlayInner {
                             | sstatx::STATX_NLINK
                             | sstatx::STATX_INO,
                     ) {
-                        Ok(st) => (
-                            st.st_ino as u64,
-                            st.st_dev as u64,
-                            st.st_mode,
-                            st.st_nlink as u64,
-                        ),
-                        Err(_) => (entry.ino, 0, if is_dir { libc::S_IFDIR } else { 0 }, 1),
+                        if Self::is_chardev_whiteout(&st) {
+                            if let Some(parent) = self.nodes.get_mut(&parent_id) {
+                                parent.insert_whiteout(entry.name);
+                            }
+                            continue;
+                        }
+                        entry_stat = Some(st);
                     }
+                }
+
+                // Normal entries start with metadata supplied by readdir.  A
+                // full stat is deferred until lookup/getattr/readdirplus needs
+                // it, avoiding one safe path resolution per directory entry.
+                let (ino, dev, mode, nlink, metadata_valid) = if let Some(st) = entry_stat {
+                    (
+                        st.st_ino as u64,
+                        st.st_dev as u64,
+                        st.st_mode,
+                        st.st_nlink as u64,
+                        true,
+                    )
+                } else {
+                    (
+                        entry.ino,
+                        self.layers[layer_idx].st_dev() as u64,
+                        dtype_to_mode(entry.dtype),
+                        1,
+                        false,
+                    )
                 };
 
-                let actual_is_dir = (mode & libc::S_IFMT) == libc::S_IFDIR || is_dir;
-                let mut child = OvlNode::new(entry.name, layer_idx, ino, dev, actual_is_dir);
+                let is_dir = (mode & libc::S_IFMT) == libc::S_IFDIR;
+                let mut child = OvlNode::new(entry.name, layer_idx, ino, dev, is_dir);
                 child.mode = mode;
                 child.tmp_nlink = nlink;
+                child.metadata_valid = metadata_valid;
                 child.last_layer_idx = layer_idx;
                 child.parent = Some(parent_id);
                 self.insert_child_node(parent_id, child);
@@ -1011,6 +1190,7 @@ impl OverlayInner {
         let last_layer_idx = self.dir_last_layer(parent_id)?;
         let mut found_node: Option<OvlNode> = None;
         let mut stop_lookup = false;
+        let child_path = Self::child_path(&parent_path, name);
 
         for layer_idx in 0..self.layers.len() {
             if stop_lookup {
@@ -1020,13 +1200,35 @@ impl OverlayInner {
                 stop_lookup = true;
             }
 
-            let path = Self::child_path(&parent_path, name);
-
-            let stat_result = self.layers[layer_idx].ds.statat(
-                &path,
-                libc::AT_SYMLINK_NOFOLLOW,
-                sstatx::STATX_TYPE | sstatx::STATX_MODE | sstatx::STATX_NLINK | sstatx::STATX_INO,
-            );
+            let parent_fd = if parent_id == self.root_id {
+                Ok(None)
+            } else {
+                self.cached_parent_fd(layer_idx, parent_id).map(Some)
+            };
+            let (stat_result, has_whiteout) = match parent_fd {
+                Err(e) => (Err(e), false),
+                Ok(parent_fd) if found_node.is_some() => (
+                    self.layers[layer_idx].ds.statat_child(
+                        parent_fd.as_deref(),
+                        name,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                        sstatx::STATX_TYPE
+                            | sstatx::STATX_MODE
+                            | sstatx::STATX_NLINK
+                            | sstatx::STATX_INO,
+                    ),
+                    false,
+                ),
+                Ok(parent_fd) => self.layers[layer_idx].ds.statat_child_with_whiteout(
+                    parent_fd.as_deref(),
+                    name,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                    sstatx::STATX_TYPE
+                        | sstatx::STATX_MODE
+                        | sstatx::STATX_NLINK
+                        | sstatx::STATX_INO,
+                ),
+            };
 
             match stat_result {
                 Err(e) if e.0 == libc::ENOENT || e.0 == libc::ENOTDIR || e.0 == libc::EACCES => {
@@ -1034,7 +1236,7 @@ impl OverlayInner {
                         continue;
                     }
                     // Whiteout found: record in parent's whiteout set and stop
-                    if self.is_wh_file(layer_idx, &parent_path, name) {
+                    if has_whiteout {
                         if let Some(parent) = self.nodes.get_mut(&parent_id) {
                             parent.insert_whiteout(name.to_vec());
                         }
@@ -1053,7 +1255,7 @@ impl OverlayInner {
                     }
 
                     // Whiteout found: record in parent's whiteout set and stop
-                    if self.is_wh_file(layer_idx, &parent_path, name) {
+                    if has_whiteout {
                         if let Some(parent) = self.nodes.get_mut(&parent_id) {
                             parent.insert_whiteout(name.to_vec());
                         }
@@ -1090,7 +1292,7 @@ impl OverlayInner {
                         && matches!(
                             whiteout::is_directory_opaque(
                                 self.layers[layer_idx].ds.as_ref(),
-                                &path
+                                &child_path
                             ),
                             Ok(true)
                         )
@@ -1163,77 +1365,65 @@ impl OverlayInner {
 
         // "." entry
         let self_ino = self.get_st_ino_with_path(node, &dir_path, config);
-        let self_attr = self
-            .rpl_stat_with_path(node_id, -1, config, &dir_path)
-            .ok()
-            .map(|st| stat_to_attr(&st));
         entries.push(DirEntry {
             name: b".".to_vec(),
             ino: self_ino,
             mode: libc::S_IFDIR,
-            attr: self_attr,
             node_id: Some(node_id),
         });
 
         // ".." entry
         let parent_id = node.parent;
-        let (parent_ino, parent_attr) = if let Some(pid) = parent_id {
+        let parent_ino = if let Some(pid) = parent_id {
             if let Some(parent) = self.nodes.get(&pid) {
                 let parent_path = self.node_path(pid);
-                let ino = self.get_st_ino_with_path(parent, &parent_path, config);
-                let attr = self
-                    .rpl_stat_with_path(pid, -1, config, &parent_path)
-                    .ok()
-                    .map(|st| stat_to_attr(&st));
-                (ino, attr)
+                self.get_st_ino_with_path(parent, &parent_path, config)
             } else {
-                (self_ino, self_attr)
+                self_ino
             }
         } else {
-            (self_ino, self_attr)
+            self_ino
         };
         entries.push(DirEntry {
             name: b"..".to_vec(),
             ino: parent_ino,
             mode: libc::S_IFDIR,
-            attr: parent_attr,
-            node_id: parent_id,
+            // The root has no parent node, but its ".." entry still refers to
+            // the root and needs real attributes during readdirplus.
+            node_id: Some(parent_id.unwrap_or(node_id)),
         });
 
-        // Collect child references without cloning names, sort by reference
-        let mut child_ids: Vec<(&[u8], NodeId)> = node
+        // Own names so the handle remains valid if the in-memory tree changes.
+        let mut child_ids: Vec<(Vec<u8>, NodeId)> = node
             .children()
-            .map(|ch| ch.iter().map(|(k, v)| (k.as_slice(), *v)).collect())
+            .map(|ch| ch.iter().map(|(k, v)| (k.clone(), *v)).collect())
             .unwrap_or_default();
-        child_ids.sort_unstable_by_key(|(a, _)| *a);
+        child_ids.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
 
-        // Reusable buffer for child paths (avoids N allocations)
+        // Reusable buffer for child paths (avoids N allocations).  Only inode
+        // calculation may use the path here; full attributes are loaded lazily
+        // by readdirplus and are unnecessary for ordinary readdir.
         let mut path_buf = Vec::with_capacity(dir_path.len() + 256);
         for (child_name, child_id) in child_ids {
-            if let Some(child) = self.nodes.get(&child_id)
-                && !child.hidden
-            {
-                // Build child path in reusable buffer
-                path_buf.clear();
-                if dir_path != b"." {
-                    path_buf.extend_from_slice(&dir_path);
-                    path_buf.push(b'/');
-                }
-                path_buf.extend_from_slice(&child.name);
+            let child = match self.nodes.get(&child_id) {
+                Some(child) if !child.hidden => child,
+                _ => continue,
+            };
 
-                let ino = self.get_st_ino_with_path(child, &path_buf, config);
-                let attr = self
-                    .rpl_stat_with_path(child_id, -1, config, &path_buf)
-                    .ok()
-                    .map(|st| stat_to_attr(&st));
-                entries.push(DirEntry {
-                    name: child_name.to_vec(),
-                    ino,
-                    mode: child.mode,
-                    attr,
-                    node_id: Some(child_id),
-                });
+            // Build child path in reusable buffer
+            path_buf.clear();
+            if dir_path != b"." {
+                path_buf.extend_from_slice(&dir_path);
+                path_buf.push(b'/');
             }
+            path_buf.extend_from_slice(&child_name);
+
+            entries.push(DirEntry {
+                name: child_name,
+                ino: self.get_st_ino_with_path(child, &path_buf, config),
+                mode: child.mode,
+                node_id: Some(child_id),
+            });
         }
 
         entries
@@ -1592,7 +1782,7 @@ impl Filesystem for OverlayFs {
             return;
         }
 
-        match inner.rpl_stat(node_id, -1, &self.config) {
+        match inner.rpl_stat_cached(node_id, -1, &self.config) {
             Ok(st) => {
                 let node = match inner.node(&node_id) {
                     Ok(n) => n,
@@ -3425,62 +3615,60 @@ impl Filesystem for OverlayFs {
         let offset = offset as usize;
         let ttl = Duration::from_secs_f64(self.config.timeout);
 
-        // Collect entries we need to emit (clone to release dirs lock before taking inner lock)
+        // Collect entries we may emit (clone to release the directory-handle
+        // lock before taking the overlay write lock).  Metadata is hydrated one
+        // entry at a time below, so a small kernel buffer does not stat the
+        // entire remainder of a large directory.
         let entries: Vec<_> = dh
             .entries
             .iter()
             .enumerate()
             .skip(offset)
-            .map(|(i, e)| (i, e.name.clone(), e.ino, e.mode, e.attr, e.node_id))
+            .map(|(i, e)| (i, e.name.clone(), e.node_id))
             .collect();
         drop(dirs);
 
-        // Register entries in inode table so FUSE inodes match what lookup would return
+        // Hydrate and register entries in inode table so FUSE inodes match what
+        // lookup would return.  Ordinary readdir never enters this path.
         let mut inner = self.inner.write();
-        for (i, name, raw_ino, mode, attr, node_id) in &entries {
-            let fuse_ino = if let Some(nid) = node_id {
-                if let Some(node) = inner.nodes.get(nid) {
-                    let tmp_ino = node.tmp_ino;
-                    let tmp_dev = node.tmp_dev;
-                    let nmode = node.mode;
-                    let is_lower = inner.layers[node.layer_idx].low;
-                    let oi = &mut *inner;
-                    if let Some((ino_val, key)) = oi
-                        .inodes
-                        .register(&oi.nodes, *nid, tmp_ino, tmp_dev, nmode, is_lower)
-                    {
-                        oi.inodes.inc_lookup(&key);
-                        ino_val
-                    } else {
-                        *raw_ino
-                    }
-                } else {
-                    *raw_ino
-                }
-            } else {
-                *raw_ino
+        for (i, name, node_id) in &entries {
+            let Some(nid) = node_id else {
+                debug!(
+                    "readdirplus: skipping {:?} without a backing node",
+                    String::from_utf8_lossy(name)
+                );
+                continue;
             };
 
-            let mut a = match attr {
-                Some(a) => *a,
-                None => FileAttr {
-                    ino: INodeNo(fuse_ino),
-                    size: 0,
-                    blocks: 0,
-                    atime: UNIX_EPOCH,
-                    mtime: UNIX_EPOCH,
-                    ctime: UNIX_EPOCH,
-                    crtime: UNIX_EPOCH,
-                    kind: mode_to_filetype(*mode),
-                    perm: 0o755,
-                    nlink: 1,
-                    uid: 0,
-                    gid: 0,
-                    rdev: 0,
-                    blksize: 4096,
-                    flags: 0,
-                },
+            let st = match inner.rpl_stat_cached(*nid, -1, &self.config) {
+                Ok(st) => st,
+                Err(e) => {
+                    debug!(
+                        "readdirplus: skipping {:?} after stat failed: {}",
+                        String::from_utf8_lossy(name),
+                        e.0
+                    );
+                    continue;
+                }
             };
+
+            let node = match inner.nodes.get(nid) {
+                Some(node) => node,
+                None => continue,
+            };
+            let tmp_ino = node.tmp_ino;
+            let tmp_dev = node.tmp_dev;
+            let nmode = node.mode;
+            let is_lower = inner.layers[node.layer_idx].low;
+            let oi = &mut *inner;
+            let Some((fuse_ino, lookup_key)) = oi
+                .inodes
+                .register(&oi.nodes, *nid, tmp_ino, tmp_dev, nmode, is_lower)
+            else {
+                continue;
+            };
+
+            let mut a = stat_to_attr(&st);
             a.ino = INodeNo(fuse_ino);
             let entry_ttl = if inner.inodes.is_underlying_hardlink(fuse_ino) {
                 Duration::ZERO
@@ -3497,6 +3685,7 @@ impl Filesystem for OverlayFs {
             ) {
                 break;
             }
+            inner.inodes.inc_lookup(&lookup_key);
         }
         reply.ok();
     }
@@ -3942,6 +4131,128 @@ fn parse_device(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_build_dir_entries_keeps_child_metadata_deferred() {
+        let mut nodes = NodeArena::new();
+        let mut root = OvlNode::new(Vec::new(), 0, 2, 7, true);
+        root.mark_loaded();
+        let root_id = nodes.insert(root);
+
+        let mut child = OvlNode::new(b"child".to_vec(), 0, 42, 7, false);
+        child.mode = libc::S_IFREG;
+        child.metadata_valid = false;
+        child.parent = Some(root_id);
+        let child_id = nodes.insert(child);
+        nodes
+            .get_mut(&root_id)
+            .unwrap()
+            .insert_child(b"child".to_vec(), child_id);
+
+        let mut inner = OverlayInner {
+            layers: Vec::new(),
+            inodes: InodeTable::new(),
+            nodes,
+            root_id,
+            parent_fds: Mutex::new(ParentFdCache::new(0)),
+            workdir_fd: -1,
+            ino_passthrough: true,
+            overflow: OverflowIds::read(),
+            wd_counter: 1,
+            can_mknod: false,
+        };
+
+        let entries = inner.build_dir_entries(root_id, &OverlayConfig::default());
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].node_id, Some(root_id));
+        assert_eq!(entries[1].node_id, Some(root_id));
+        assert_eq!(entries[2].name, b"child");
+        assert_eq!(entries[2].node_id, Some(child_id));
+        assert_eq!(entries[2].ino, 42);
+        assert_eq!(entries[2].mode, libc::S_IFREG);
+        assert!(!inner.nodes.get(&child_id).unwrap().metadata_valid);
+    }
+
+    #[test]
+    fn test_parent_fd_cache_evicts_least_recently_used() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::sys::openat2::open_trusted(
+            temp.path().to_str().unwrap(),
+            libc::O_PATH | libc::O_DIRECTORY,
+            0,
+        )
+        .unwrap();
+        let fd = Arc::new(
+            crate::sys::openat2::safe_openat(
+                root.as_raw_fd(),
+                b".",
+                libc::O_PATH | libc::O_DIRECTORY,
+                0,
+            )
+            .unwrap(),
+        );
+        let key1 = ParentFdKey {
+            layer_idx: 0,
+            node_id: NodeId(1),
+        };
+        let key2 = ParentFdKey {
+            layer_idx: 0,
+            node_id: NodeId(2),
+        };
+        let key3 = ParentFdKey {
+            layer_idx: 1,
+            node_id: NodeId(1),
+        };
+        let mut cache = ParentFdCache::new(2);
+        cache.insert(key1, fd.clone());
+        cache.insert(key2, fd.clone());
+        assert!(cache.get(key1).is_some());
+        cache.insert(key3, fd);
+
+        assert!(cache.get(key1).is_some());
+        assert!(cache.get(key2).is_none());
+        assert!(cache.get(key3).is_some());
+    }
+
+    #[test]
+    fn test_dtype_to_mode() {
+        assert_eq!(dtype_to_mode(libc::DT_DIR), libc::S_IFDIR);
+        assert_eq!(dtype_to_mode(libc::DT_REG), libc::S_IFREG);
+        assert_eq!(dtype_to_mode(libc::DT_LNK), libc::S_IFLNK);
+        assert_eq!(dtype_to_mode(libc::DT_UNKNOWN), 0);
+    }
+
+    #[test]
+    fn test_collect_prefix_whiteouts_is_order_independent() {
+        let entries = vec![
+            datasource::DirEntry {
+                name: b"visible".to_vec(),
+                ino: 1,
+                dtype: libc::DT_REG,
+            },
+            datasource::DirEntry {
+                name: b".wh.hidden".to_vec(),
+                ino: 2,
+                dtype: libc::DT_REG,
+            },
+            datasource::DirEntry {
+                name: xattr::OPAQUE_WHITEOUT.as_bytes().to_vec(),
+                ino: 3,
+                dtype: libc::DT_REG,
+            },
+            datasource::DirEntry {
+                name: b".wh.before".to_vec(),
+                ino: 4,
+                dtype: libc::DT_REG,
+            },
+        ];
+
+        assert_eq!(
+            OverlayInner::collect_prefix_whiteouts(&entries),
+            vec![b"hidden".to_vec(), b"before".to_vec()]
+        );
+    }
 
     #[test]
     fn test_parse_override_3_fields() {
